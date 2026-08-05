@@ -1,0 +1,46 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <OutputType>Library</OutputType>
+    <RootNamespace>MissionHelperExtension</RootNamespace>
+    <AssemblyName>MissionHelperExtension</AssemblyName>
+    <UseWindowsForms>true</UseWindowsForms>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <!--
+    Provides .NET Framework 4.8 reference assemblies on any OS (macOS/Linux/Windows).
+    This removes the need to install the .NET Framework Developer Pack.
+  -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies.net48"
+                      Version="1.0.3"
+                      PrivateAssets="all" />
+  </ItemGroup>
+
+  <!--
+    Mission Planner DLLs — relative path to ../lib/
+    Copy the required files from your Mission Planner install into that folder.
+  -->
+  <ItemGroup>
+    <Reference Include="MissionPlanner">
+      <HintPath>..\lib\MissionPlanner.exe</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MissionPlanner.Utilities">
+      <HintPath>..\lib\MissionPlanner.Utilities.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="MAVLink">
+      <HintPath>..\lib\MAVLink.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="GMap.NET.Core">
+      <HintPath>..\lib\GMap.NET.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>
