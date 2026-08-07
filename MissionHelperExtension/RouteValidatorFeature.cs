@@ -16,8 +16,8 @@ namespace MissionHelperExtension
     ///      3rd waypoint from the end (that one is a command with azimuth 0).
     ///   2. The Frame of every waypoint must be Absolute (not Relative/Terrain).
     ///   3. Every Angle value must be within the range [-2, +2].
-    ///   4. The 2nd waypoint must be 90-110 m higher than home.
-    ///   5. The TAKEOFF waypoint must be 9-11 m higher than home.
+    ///   4. The 2nd waypoint must be 9-11 m higher than the TAKEOFF waypoint.
+    ///   5. The TAKEOFF waypoint must be 90-110 m higher than home.
     ///   6. No point on the cruise portion may be below 30 m above terrain
     ///      (checked on demand via the Validate button; takeoff/landing excluded).
     /// The offending grid cells are highlighted in red, and validation re-runs when a
@@ -38,19 +38,18 @@ namespace MissionHelperExtension
         // The first waypoint must be a TAKEOFF with this exact pitch angle (Param1), in degrees.
         private const double TakeoffPitch = 6.0;
 
-        // The TAKEOFF waypoint must be this much higher than home (in metres), same AMSL
-        // basis as the 2nd-waypoint rule.
-        private const double TakeoffMinAboveHome = 9.0;
-        private const double TakeoffMaxAboveHome = 11.0;
+        // The TAKEOFF waypoint must be this much higher than home (in metres). Frames are
+        // Absolute (enforced by rule 2), so both altitudes are AMSL and the difference is
+        // the height above home.
+        private const double TakeoffMinAboveHome = 90.0;
+        private const double TakeoffMaxAboveHome = 110.0;
 
         // The 3rd waypoint from the end must be DO_CHANGE_SPEED with this exact speed (Param2).
         private const double ChangeSpeedValue = 42.0;
 
-        // The 2nd waypoint must be this much higher than home (in metres). Frames are
-        // Absolute (enforced by rule 2), so both altitudes are AMSL and the difference
-        // is the height above home.
-        private const double SecondWpMinAboveHome = 90.0;
-        private const double SecondWpMaxAboveHome = 110.0;
+        // The 2nd waypoint must be this much higher than the TAKEOFF waypoint (in metres).
+        private const double SecondWpMinAboveTakeoff = 9.0;
+        private const double SecondWpMaxAboveTakeoff = 11.0;
 
         // Minimum required clearance above the terrain along the cruise portion of the
         // route (in metres), and the spacing at which each leg is sampled.
@@ -479,7 +478,7 @@ namespace MissionHelperExtension
                 _rowsToHighlight.Add(0);
             }
 
-            // The TAKEOFF waypoint must be 9-11 m above home (same AMSL basis as rule 4).
+            // The TAKEOFF waypoint must be 90-110 m above home.
             string altCol = FindColumn("Alt", "alt", "ALT", "Altitude", "altitude", "Z", "z");
             if (altCol == null)
             {
@@ -505,9 +504,9 @@ namespace MissionHelperExtension
         }
 
         /// <summary>
-        /// Rule 4: the 2nd waypoint must be 90-110 m higher than home. Frames are
-        /// Absolute, so the grid Alt is AMSL; home altitude comes from the Flight
-        /// Planner's home-altitude box (TXT_homealt) on the same form.
+        /// Rule 4: the 2nd waypoint must be 9-11 m higher than the TAKEOFF waypoint.
+        /// Frames are Absolute, so the grid Alt is AMSL and the difference between the two
+        /// waypoint altitudes is the height of WP 2 above the takeoff point.
         /// </summary>
         private void CheckSecondWaypointAltitude(int count, List<string> messages)
         {
@@ -524,22 +523,16 @@ namespace MissionHelperExtension
                 return;
             }
 
-            if (!TryGetHomeAltitude(out double homeAlt))
-            {
-                messages.Add("Висота 2-ї точки: не знайдено висоту дому (поле 'Home Alt' у Flight Planner).");
-                return;
-            }
+            double takeoffAlt = GetCellDouble(_grid.Rows[0], altCol);
+            double wpAlt = GetCellDouble(_grid.Rows[1], altCol);
+            double aboveTakeoff = wpAlt - takeoffAlt;
 
-            const int idx = 1; // 2nd waypoint
-            double wpAlt = GetCellDouble(_grid.Rows[idx], altCol);
-            double aboveHome = wpAlt - homeAlt;
-
-            if (aboveHome < SecondWpMinAboveHome || aboveHome > SecondWpMaxAboveHome)
+            if (aboveTakeoff < SecondWpMinAboveTakeoff || aboveTakeoff > SecondWpMaxAboveTakeoff)
             {
                 messages.Add(
-                    $"Точка {idx + 1} має бути на {SecondWpMinAboveHome:0.#}-{SecondWpMaxAboveHome:0.#} м вище дому " +
-                    $"(зараз {aboveHome:0.#} м: висота {wpAlt:0.#} м, дім {homeAlt:0.#} м).");
-                _rowsToHighlight.Add(idx);
+                    $"Точка 2 має бути на {SecondWpMinAboveTakeoff:0.#}-{SecondWpMaxAboveTakeoff:0.#} м вище точки зльоту " +
+                    $"(зараз {aboveTakeoff:0.#} м: висота {wpAlt:0.#} м, TAKEOFF {takeoffAlt:0.#} м).");
+                _rowsToHighlight.Add(1);
             }
         }
 
