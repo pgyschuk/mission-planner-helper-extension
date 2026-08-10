@@ -19,15 +19,16 @@ namespace MissionHelperExtension
     ///   4. The 2nd waypoint must be 9-11 m higher than the TAKEOFF waypoint.
     ///   5. The TAKEOFF waypoint must be 90-110 m higher than home.
     ///   6. No point on the cruise portion may be below 30 m above terrain
-    ///      (checked on demand via the Validate button; takeoff/landing excluded).
+    ///      (run in the background so it never blocks the UI; takeoff/landing excluded).
+    ///   7. The turn angle at each waypoint should be at least 110°: 90-110° is a
+    ///      warning (yellow), below 90° is an error (red).
     /// The offending grid cells are highlighted in red, and validation re-runs when a
     /// value changes or a new mission file is loaded.
     /// </summary>
     public class RouteValidatorFeature
     {
-        // Azimuth values are display-rounded, so allow a small tolerance when
-        // comparing them for equality (in degrees).
-        private const double AzimuthToleranceDeg = 1.0;
+        // The azimuth (AZ) of the last waypoints must match exactly (no tolerance).
+        private const double AzimuthToleranceDeg = 0.0;
         private const double AngleMin = -2.0;
         private const double AngleMax = 2.0;
 
@@ -47,20 +48,30 @@ namespace MissionHelperExtension
         // The 3rd waypoint from the end must be DO_CHANGE_SPEED with this exact speed (Param2).
         private const double ChangeSpeedValue = 42.0;
 
-        // The 2nd waypoint must be this much higher than the TAKEOFF waypoint (in metres).
-        private const double SecondWpMinAboveTakeoff = 9.0;
-        private const double SecondWpMaxAboveTakeoff = 11.0;
+        // The 2nd waypoint must be at least this much higher than the TAKEOFF waypoint
+        // (in metres). There is no upper bound.
+        private const double SecondWpMinAboveTakeoff = 10.0;
 
         // Minimum required clearance above the terrain along the cruise portion of the
         // route (in metres), and the spacing at which each leg is sampled.
         private const double MinTerrainClearance = 30.0;
         private const double TerrainSampleSpacingM = 30.0;
 
+        // Turn-angle thresholds at a waypoint, in degrees. This is the interior angle
+        // between the incoming and outgoing legs: 180° is a straight pass-through, a
+        // smaller angle is a sharper turn. At/above TurnWarnAngle is OK; between the two
+        // thresholds is a warning (yellow); below TurnErrorAngle is an error (red).
+        private const double TurnErrorAngle = 90.0;
+        private const double TurnWarnAngle = 110.0;
+
         private static readonly Color OkColor = Color.FromArgb(0, 128, 0);
         private static readonly Color FailColor = Color.FromArgb(192, 0, 0);
+        private static readonly Color WarnColor = Color.FromArgb(200, 150, 0);
         private static readonly Color EmptyColor = Color.FromArgb(80, 80, 80);
         private static readonly Color BadCellColor = Color.FromArgb(180, 50, 50);
         private static readonly Color BadCellForeColor = Color.White;
+        private static readonly Color WarnCellColor = Color.FromArgb(170, 140, 30);
+        private static readonly Color WarnCellForeColor = Color.White;
 
         private readonly DataGridView _grid;
         private readonly Action<string> _log;
@@ -76,9 +87,11 @@ namespace MissionHelperExtension
         // Results are split into synchronous rules (fast, run inline) and the terrain
         // clearance rule (slow, run on a background task). The button/highlights show the
         // union of both.
-        private readonly HashSet<int> _rowsToHighlight = new HashSet<int>();  // sync rows
-        private List<string> _syncMessages = new List<string>();
-        private List<string> _terrainMessages = new List<string>();
+        private readonly HashSet<int> _rowsToHighlight = new HashSet<int>();  // sync error rows (red)
+        private readonly HashSet<int> _warnRows = new HashSet<int>();         // sync warning rows (yellow)
+        private List<string> _syncMessages = new List<string>();              // sync errors
+        private List<string> _syncWarnings = new List<string>();              // sync warnings
+        private List<string> _terrainMessages = new List<string>();           // terrain errors
         private HashSet<int> _terrainRows = new HashSet<int>();
         private List<string> _lastMessages = new List<string>();  // combined (for the dialog)
         private string _lastSignature = "";
@@ -349,7 +362,9 @@ namespace MissionHelperExtension
             if (_validateButton == null) return;
 
             _rowsToHighlight.Clear();
+            _warnRows.Clear();
             _syncMessages = new List<string>();
+            _syncWarnings = new List<string>();
 
             // Nothing to validate for an empty plan - show a neutral state instead.
             if (GetEffectiveRowCount() == 0)
@@ -375,6 +390,7 @@ namespace MissionHelperExtension
                 CheckAzimuth(count, _syncMessages);
                 CheckFrames(count, _syncMessages);
                 CheckAngles(count, _syncMessages);
+                CheckTurnAngles(count, _syncMessages);
             }
             catch (Exception ex)
             {
@@ -399,15 +415,21 @@ namespace MissionHelperExtension
         {
             if (_validateButton == null) return;
 
-            var combined = new List<string>(_syncMessages);
-            combined.AddRange(_terrainMessages);
-            _lastMessages = combined;
+            var errors = new List<string>(_syncMessages);
+            errors.AddRange(_terrainMessages);
+            var warnings = new List<string>(_syncWarnings);
 
-            var rows = new HashSet<int>(_rowsToHighlight);
-            rows.UnionWith(_terrainRows);
-            ApplyHighlights(rows);
+            // Combined list for the dialog: errors first, warnings marked with a sign.
+            var all = new List<string>(errors);
+            foreach (var w in warnings) all.Add("⚠ " + w);
+            _lastMessages = all;
 
-            UpdateButton(combined);
+            var errorRows = new HashSet<int>(_rowsToHighlight);
+            errorRows.UnionWith(_terrainRows);
+            var warnRows = new HashSet<int>(_warnRows);
+
+            ApplyHighlights(errorRows, warnRows);
+            UpdateButton(errors, warnings);
         }
 
         private void ShowEmptyState()
@@ -418,25 +440,79 @@ namespace MissionHelperExtension
             _validateButton.Text = "Немає маршруту";
             _validateButton.FlatAppearance.BorderColor = Color.FromArgb(64, 64, 64);
             _toolTip?.SetToolTip(_validateButton, "Немає точок для перевірки.");
+            FitButtonWidth();
         }
 
-        private void UpdateButton(List<string> messages)
+        private void UpdateButton(List<string> errors, List<string> warnings)
         {
-            bool ok = messages.Count == 0;
             string suffix = _terrainScanning ? " …" : "";
 
-            _validateButton.BackColor = ok ? OkColor : FailColor;
-            _validateButton.Text = (ok ? "Маршрут OK" : $"Маршрут: {messages.Count} проблем(и)") + suffix;
-            _validateButton.FlatAppearance.BorderColor = ok
-                ? Color.FromArgb(0, 96, 0)
-                : Color.FromArgb(128, 0, 0);
+            Color back, border;
+            string text;
+            if (errors.Count > 0)
+            {
+                back = FailColor;
+                border = Color.FromArgb(128, 0, 0);
+                text = $"Маршрут: {errors.Count} проблем(и)";
+            }
+            else if (warnings.Count > 0)
+            {
+                back = WarnColor;
+                border = Color.FromArgb(150, 110, 0);
+                text = $"Маршрут: {warnings.Count} попереджень";
+            }
+            else
+            {
+                back = OkColor;
+                border = Color.FromArgb(0, 96, 0);
+                text = "Маршрут OK";
+            }
 
-            string tip = ok
-                ? "Маршрут дійсний."
-                : string.Join(Environment.NewLine, messages);
+            _validateButton.BackColor = back;
+            _validateButton.FlatAppearance.BorderColor = border;
+            _validateButton.Text = text + suffix;
+            FitButtonWidth();
+
+            string tip;
+            if (errors.Count == 0 && warnings.Count == 0)
+            {
+                tip = "Маршрут дійсний.";
+            }
+            else
+            {
+                var lines = new List<string>(errors);
+                foreach (var w in warnings) lines.Add("⚠ " + w);
+                tip = string.Join(Environment.NewLine, lines);
+            }
             if (_terrainScanning)
                 tip += (tip.Length > 0 ? Environment.NewLine : "") + "Перевірка рельєфу…";
             _toolTip?.SetToolTip(_validateButton, tip);
+        }
+
+        /// <summary>
+        /// Resizes the button to fit its current text (so longer captions such as
+        /// "Маршрут: N попереджень" are not clipped), keeping the right edge fixed when
+        /// the button is anchored to the right of a shared panel.
+        /// </summary>
+        private void FitButtonWidth()
+        {
+            if (_validateButton == null) return;
+
+            try
+            {
+                Size pref = TextRenderer.MeasureText(_validateButton.Text, _validateButton.Font);
+                int desired = Math.Max(120, pref.Width + 24); // padding for text + border
+                if (desired == _validateButton.Width) return;
+
+                int right = _validateButton.Left + _validateButton.Width;
+                _validateButton.Width = desired;
+
+                // Anchored to the right (shared host panel): keep the right edge in place
+                // by moving the left edge. Otherwise (own panel) the left edge stays put.
+                if ((_validateButton.Anchor & AnchorStyles.Right) != 0)
+                    _validateButton.Left = Math.Max(0, right - desired);
+            }
+            catch { }
         }
 
         #region Validation rules
@@ -504,7 +580,7 @@ namespace MissionHelperExtension
         }
 
         /// <summary>
-        /// Rule 4: the 2nd waypoint must be 9-11 m higher than the TAKEOFF waypoint.
+        /// Rule 4: the 2nd waypoint must be at least 10 m higher than the TAKEOFF waypoint.
         /// Frames are Absolute, so the grid Alt is AMSL and the difference between the two
         /// waypoint altitudes is the height of WP 2 above the takeoff point.
         /// </summary>
@@ -527,10 +603,10 @@ namespace MissionHelperExtension
             double wpAlt = GetCellDouble(_grid.Rows[1], altCol);
             double aboveTakeoff = wpAlt - takeoffAlt;
 
-            if (aboveTakeoff < SecondWpMinAboveTakeoff || aboveTakeoff > SecondWpMaxAboveTakeoff)
+            if (aboveTakeoff < SecondWpMinAboveTakeoff)
             {
                 messages.Add(
-                    $"Точка 2 має бути на {SecondWpMinAboveTakeoff:0.#}-{SecondWpMaxAboveTakeoff:0.#} м вище точки зльоту " +
+                    $"Точка 2 має бути щонайменше на {SecondWpMinAboveTakeoff:0.#} м вище точки зльоту " +
                     $"(зараз {aboveTakeoff:0.#} м: висота {wpAlt:0.#} м, TAKEOFF {takeoffAlt:0.#} м).");
                 _rowsToHighlight.Add(1);
             }
@@ -711,6 +787,81 @@ namespace MissionHelperExtension
             if (badRows.Count > 0)
             {
                 messages.Add($"Кут поза діапазоном: {string.Join(", ", badRows)}.");
+            }
+        }
+
+        /// <summary>
+        /// Rule 7: the turn at each waypoint must not be too sharp. For three consecutive
+        /// positional waypoints P1 -> P2 -> P3, the interior angle at P2 (between the
+        /// incoming leg P2->P1 and the outgoing leg P2->P3) should be at least
+        /// <see cref="TurnWarnAngle"/> degrees. 180° is a straight pass-through; a smaller
+        /// angle is a sharper turn. Between the two thresholds is a warning (yellow), below
+        /// <see cref="TurnErrorAngle"/> is an error (red). Command waypoints without a
+        /// position (e.g. DO_CHANGE_SPEED) are skipped so they don't distort the geometry.
+        /// </summary>
+        private void CheckTurnAngles(int count, List<string> messages)
+        {
+            if (count < 3) return;
+
+            string latCol = FindColumn("Lat", "lat", "LAT", "Latitude", "latitude");
+            string lngCol = FindColumn("Long", "Lng", "lng", "long", "LON", "Lon", "Longitude", "longitude");
+            if (latCol == null || lngCol == null)
+            {
+                messages.Add("Кут повороту: стовпці Lat/Long не знайдено в таблиці.");
+                return;
+            }
+
+            // Positional waypoints in flight order (command waypoints without coordinates
+            // are skipped - the aircraft does not turn at them).
+            var pts = new List<(int row, double lat, double lng)>();
+            for (int i = 0; i < count; i++)
+            {
+                double lat = GetCellDouble(_grid.Rows[i], latCol);
+                double lng = GetCellDouble(_grid.Rows[i], lngCol);
+                if (HasPosition(lat, lng)) pts.Add((i, lat, lng));
+            }
+
+            // The aircraft starts at home, so home is the predecessor of the first real
+            // waypoint - prepend it (row -1, never highlighted) so the turn at that first
+            // waypoint (e.g. home -> WP2 -> WP3) is evaluated too. The TAKEOFF command
+            // itself usually has no coordinates and was skipped above.
+            if (TryGetHomeLatLng(out double homeLat, out double homeLng) && HasPosition(homeLat, homeLng))
+            {
+                pts.Insert(0, (-1, homeLat, homeLng));
+            }
+
+            if (pts.Count < 3) return;
+
+            var errSharp = new List<string>();   // angle < TurnErrorAngle  -> red
+            var warnSharp = new List<string>();  // TurnErrorAngle..TurnWarnAngle -> yellow
+            for (int k = 1; k < pts.Count - 1; k++)
+            {
+                var prev = pts[k - 1];
+                var cur = pts[k];
+                var next = pts[k + 1];
+
+                double angle = InteriorAngleDeg(cur.lat, cur.lng, prev.lat, prev.lng, next.lat, next.lng);
+                if (double.IsNaN(angle)) continue; // coincident points - undefined turn
+
+                if (angle < TurnErrorAngle)
+                {
+                    errSharp.Add($"точка {cur.row + 1} ({angle:0}°)");
+                    _rowsToHighlight.Add(cur.row);
+                }
+                else if (angle < TurnWarnAngle)
+                {
+                    warnSharp.Add($"точка {cur.row + 1} ({angle:0}°)");
+                    _warnRows.Add(cur.row);
+                }
+            }
+
+            if (errSharp.Count > 0)
+            {
+                messages.Add($"Занадто різкий поворот (кут < {TurnErrorAngle:0}°) у: {string.Join(", ", errSharp)}.");
+            }
+            if (warnSharp.Count > 0)
+            {
+                _syncWarnings.Add($"Гострий поворот (кут {TurnErrorAngle:0}–{TurnWarnAngle:0}°, бажано ≥ {TurnWarnAngle:0}°) у: {string.Join(", ", warnSharp)}.");
             }
         }
 
@@ -985,6 +1136,29 @@ namespace MissionHelperExtension
         }
 
         /// <summary>
+        /// Interior angle (degrees, 0..180) at a vertex, between the vertex-&gt;a and
+        /// vertex-&gt;b directions. Uses a local equirectangular projection (longitude
+        /// scaled by cos(latitude)) so the angle is correct over the short distances
+        /// between waypoints. Returns NaN if a or b coincides with the vertex.
+        /// </summary>
+        private static double InteriorAngleDeg(
+            double vLat, double vLng, double aLat, double aLng, double bLat, double bLng)
+        {
+            double cosLat = Math.Cos(vLat * Math.PI / 180.0);
+            double ax = (aLng - vLng) * cosLat, ay = aLat - vLat;
+            double bx = (bLng - vLng) * cosLat, by = bLat - vLat;
+
+            double magA = Math.Sqrt(ax * ax + ay * ay);
+            double magB = Math.Sqrt(bx * bx + by * by);
+            if (magA < 1e-12 || magB < 1e-12) return double.NaN;
+
+            double cos = (ax * bx + ay * by) / (magA * magB);
+            if (cos > 1.0) cos = 1.0;
+            else if (cos < -1.0) cos = -1.0;
+            return Math.Acos(cos) * 180.0 / Math.PI;
+        }
+
+        /// <summary>
         /// Exact (case-insensitive) command-name match, so e.g. "VTOL_TAKEOFF" does not
         /// satisfy a "TAKEOFF" requirement.
         /// </summary>
@@ -998,23 +1172,36 @@ namespace MissionHelperExtension
 
         #region Cell highlighting
 
-        private void ApplyHighlights(HashSet<int> rowsToHighlight)
+        private void ApplyHighlights(HashSet<int> errorRows, HashSet<int> warnRows)
         {
             ClearHighlights();
 
-            foreach (int rowIndex in rowsToHighlight)
+            // Warnings first (yellow); a row that is also an error is skipped here so the
+            // red error colour wins.
+            foreach (int rowIndex in warnRows)
             {
-                try
-                {
-                    if (rowIndex < 0 || rowIndex >= _grid.RowCount) continue;
-
-                    var row = _grid.Rows[rowIndex];
-                    row.DefaultCellStyle.BackColor = BadCellColor;
-                    row.DefaultCellStyle.ForeColor = BadCellForeColor;
-                    _highlightedRows.Add(row);
-                }
-                catch { }
+                if (errorRows.Contains(rowIndex)) continue;
+                ColorRow(rowIndex, WarnCellColor, WarnCellForeColor);
             }
+
+            foreach (int rowIndex in errorRows)
+            {
+                ColorRow(rowIndex, BadCellColor, BadCellForeColor);
+            }
+        }
+
+        private void ColorRow(int rowIndex, Color back, Color fore)
+        {
+            try
+            {
+                if (rowIndex < 0 || rowIndex >= _grid.RowCount) return;
+
+                var row = _grid.Rows[rowIndex];
+                row.DefaultCellStyle.BackColor = back;
+                row.DefaultCellStyle.ForeColor = fore;
+                _highlightedRows.Add(row);
+            }
+            catch { }
         }
 
         private void ClearHighlights()
@@ -1106,9 +1293,11 @@ namespace MissionHelperExtension
 
             var sb = new StringBuilder();
             sb.Append(_grid.RowCount).Append('|');
-            // Home altitude lives outside the grid, so include it: editing it raises no
-            // grid event but must still re-trigger the 2nd-waypoint-altitude check.
+            // Home altitude/position live outside the grid, so include them: editing them
+            // raises no grid event but must still re-trigger the altitude and turn checks.
             if (TryGetHomeAltitude(out double homeAlt)) sb.Append(homeAlt);
+            sb.Append(',');
+            if (TryGetHomeLatLng(out double hLat, out double hLng)) sb.Append(hLat).Append(',').Append(hLng);
             sb.Append('|');
 
             for (int i = 0; i < _grid.RowCount; i++)
@@ -1137,13 +1326,34 @@ namespace MissionHelperExtension
         /// </summary>
         private bool TryGetHomeAltitude(out double homeAlt)
         {
-            homeAlt = 0;
+            return TryReadNamedDouble("TXT_homealt", out homeAlt);
+        }
+
+        /// <summary>
+        /// Reads the Flight Planner's home position from its TXT_homelat / TXT_homelng
+        /// text boxes. Both must be present and parseable.
+        /// </summary>
+        private bool TryGetHomeLatLng(out double lat, out double lng)
+        {
+            bool okLat = TryReadNamedDouble("TXT_homelat", out lat);
+            bool okLng = TryReadNamedDouble("TXT_homelng", out lng);
+            return okLat && okLng;
+        }
+
+        /// <summary>
+        /// Reads a named text box (searched on the grid's form, then any open form) and
+        /// parses its text as a double. Returns false if the control is missing/empty or
+        /// the value doesn't parse.
+        /// </summary>
+        private bool TryReadNamedDouble(string controlName, out double value)
+        {
+            value = 0;
 
             Control box = null;
             try
             {
                 Control root = _grid?.TopLevelControl ?? _grid?.FindForm();
-                box = FindControlByName(root, "TXT_homealt");
+                box = FindControlByName(root, controlName);
                 if (box == null)
                 {
                     // Fallback: the box may live on a different open form than the grid.
@@ -1153,7 +1363,7 @@ namespace MissionHelperExtension
                     foreach (Form form in Application.OpenForms) forms.Add(form);
                     foreach (Form form in forms)
                     {
-                        box = FindControlByName(form, "TXT_homealt");
+                        box = FindControlByName(form, controlName);
                         if (box != null) break;
                     }
                 }
@@ -1167,7 +1377,7 @@ namespace MissionHelperExtension
 
             string strVal = text.Trim().Replace(',', '.');
             return double.TryParse(strVal, NumberStyles.Any,
-                CultureInfo.InvariantCulture, out homeAlt);
+                CultureInfo.InvariantCulture, out value);
         }
 
         private static Control FindControlByName(Control parent, string name)
