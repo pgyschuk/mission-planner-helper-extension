@@ -30,6 +30,7 @@ namespace MissionHelperExtension
         private DistanceTotalFeature _distanceFeature;
         private WaypointCopyFeature _copyFeature;
         private RouteValidatorFeature _validatorFeature;
+        private RouteFollowFeature _followFeature;
 
         private void Log(string message)
         {
@@ -142,6 +143,17 @@ namespace MissionHelperExtension
                 Log($"ERROR initializing RouteValidatorFeature: {ex.Message}\n{ex.StackTrace}");
             }
 
+            try
+            {
+                // Sit directly above the copy/validator control line.
+                _followFeature = new RouteFollowFeature(_wpGrid, Log, Host, _copyFeature?.ControlPanel);
+                _followFeature.Initialize();
+            }
+            catch (Exception ex)
+            {
+                Log($"ERROR initializing RouteFollowFeature: {ex.Message}\n{ex.StackTrace}");
+            }
+
             Log("All features initialized");
         }
 
@@ -160,6 +172,7 @@ namespace MissionHelperExtension
             _distanceFeature?.Cleanup();
             _copyFeature?.Cleanup();
             _validatorFeature?.Cleanup();
+            _followFeature?.Cleanup();
 
             return true;
         }
