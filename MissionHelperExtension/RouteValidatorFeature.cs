@@ -12,10 +12,10 @@ namespace MissionHelperExtension
     /// <summary>
     /// Feature: Validates the route and shows a green/red status button.
     /// Rules:
-    ///   1. The azimuth (AZ) of the last 4 waypoints must be the same, ignoring the
-    ///      3rd waypoint from the end (that one is a command with azimuth 0).
+    ///   1. The last positional waypoint before LAND must be at least 5 km from the
+    ///      LAND point.
     ///   2. The Frame of every waypoint must be Absolute (not Relative/Terrain).
-    ///   3. Every Angle value must be within the range [-2, +2].
+    ///   3. Every Angle value must be within the range [-2, +2] (LAND is not checked).
     ///   4. The 2nd waypoint must be 9-11 m higher than the TAKEOFF waypoint.
     ///   5. The TAKEOFF waypoint must be 90-110 m higher than home.
     ///   6. No point on the cruise portion may be below 30 m above terrain
@@ -27,14 +27,8 @@ namespace MissionHelperExtension
     /// </summary>
     public class RouteValidatorFeature
     {
-        // The azimuth (AZ) of the last waypoints must match exactly (no tolerance).
-        private const double AzimuthToleranceDeg = 0.0;
         private const double AngleMin = -2.0;
         private const double AngleMax = 2.0;
-
-        // LAND waypoints use a steeper (descending) approach angle, so they get their own range.
-        private const double LandAngleMin = -50.0;
-        private const double LandAngleMax = -20.0;
 
         // The first waypoint must be a TAKEOFF with this exact pitch angle (Param1), in degrees.
         private const double TakeoffPitch = 6.0;
@@ -45,8 +39,9 @@ namespace MissionHelperExtension
         private const double TakeoffMinAboveHome = 90.0;
         private const double TakeoffMaxAboveHome = 110.0;
 
-        // The 3rd waypoint from the end must be DO_CHANGE_SPEED with this exact speed (Param2).
-        private const double ChangeSpeedValue = 42.0;
+        // The last positional waypoint before LAND must be at least this far from the
+        // LAND point (in metres).
+        private const double MinDistanceBeforeLandM = 5000.0;
 
         // The 2nd waypoint must be at least this much higher than the TAKEOFF waypoint
         // (in metres). There is no upper bound.
@@ -385,9 +380,8 @@ namespace MissionHelperExtension
             {
                 CheckFirstWaypoint(count, _syncMessages);
                 CheckSecondWaypointAltitude(count, _syncMessages);
-                CheckThirdFromEnd(count, _syncMessages);
                 CheckLastWaypoint(count, _syncMessages);
-                CheckAzimuth(count, _syncMessages);
+                CheckDistanceBeforeLand(count, _syncMessages);
                 CheckFrames(count, _syncMessages);
                 CheckAngles(count, _syncMessages);
                 CheckTurnAngles(count, _syncMessages);
@@ -613,51 +607,6 @@ namespace MissionHelperExtension
         }
 
         /// <summary>
-        /// Rule: the 3rd waypoint from the end must be a DO_CHANGE_SPEED command with
-        /// speed value 42 (Param2).
-        /// </summary>
-        private void CheckThirdFromEnd(int count, List<string> messages)
-        {
-            if (count < 3)
-            {
-                messages.Add($"3-я з кінця точка: потрібно щонайменше 3 точки (знайдено {count}).");
-                return;
-            }
-
-            int idx = count - 3;
-
-            string cmdCol = FindColumn("Command", "command", "CMD", "cmd");
-            if (cmdCol == null)
-            {
-                messages.Add("3-я з кінця точка: стовпець 'Command' не знайдено в таблиці.");
-                return;
-            }
-
-            string cmd = GetCellString(_grid.Rows[idx], cmdCol);
-            if (!CommandEquals(cmd, "DO_CHANGE_SPEED"))
-            {
-                messages.Add($"Точка {idx + 1} (3-я з кінця) має бути DO_CHANGE_SPEED (знайдено '{(string.IsNullOrEmpty(cmd) ? "порожньо" : cmd)}').");
-                _rowsToHighlight.Add(idx);
-                return;
-            }
-
-            // For DO_CHANGE_SPEED the target speed is stored in Param2.
-            string speedCol = FindColumn("Param2", "param2", "P2", "p2");
-            if (speedCol == null)
-            {
-                messages.Add("3-я з кінця точка: стовпець 'Param2' (швидкість) не знайдено в таблиці.");
-                return;
-            }
-
-            double speed = GetCellDouble(_grid.Rows[idx], speedCol);
-            if (speed != ChangeSpeedValue)
-            {
-                messages.Add($"Точка {idx + 1} (DO_CHANGE_SPEED): швидкість має бути {ChangeSpeedValue:0.#} (знайдено {speed:0.##}).");
-                _rowsToHighlight.Add(idx);
-            }
-        }
-
-        /// <summary>
         /// Rule: the last waypoint must be a LAND command.
         /// </summary>
         private void CheckLastWaypoint(int count, List<string> messages)
@@ -681,46 +630,60 @@ namespace MissionHelperExtension
         }
 
         /// <summary>
-        /// Rule 1: azimuth of the last 4 waypoints must match, ignoring the 3rd from
-        /// the end (a command with azimuth 0). Compares waypoints n-1, n-2 and n-4.
+        /// Rule 1: the last positional waypoint before LAND must be at least 5 km from the
+        /// LAND point. Command waypoints without a position are skipped when looking for
+        /// the previous point. Only runs when the last waypoint
+        /// is LAND - otherwise <see cref="CheckLastWaypoint"/> already reports it.
         /// </summary>
-        private void CheckAzimuth(int count, List<string> messages)
+        private void CheckDistanceBeforeLand(int count, List<string> messages)
         {
-            if (count < 4)
+            if (count < 2) return;
+
+            string cmdCol = FindColumn("Command", "command", "CMD", "cmd");
+            if (cmdCol == null) return; // reported by CheckLastWaypoint
+
+            int landIdx = count - 1;
+            if (!CommandEquals(GetCellString(_grid.Rows[landIdx], cmdCol), "LAND")) return;
+
+            string latCol = FindColumn("Lat", "lat", "LAT", "Latitude", "latitude");
+            string lngCol = FindColumn("Long", "Lng", "lng", "long", "LON", "Lon", "Longitude", "longitude");
+            if (latCol == null || lngCol == null)
             {
-                messages.Add($"Азимут: потрібно щонайменше 4 точки для перевірки (знайдено {count}).");
+                messages.Add("Відстань до LAND: стовпці Lat/Long не знайдено в таблиці.");
                 return;
             }
 
-            string azCol = FindColumn("AZ", "az", "Azimuth", "azimuth");
-            if (azCol == null)
+            double landLat = GetCellDouble(_grid.Rows[landIdx], latCol);
+            double landLng = GetCellDouble(_grid.Rows[landIdx], lngCol);
+            if (!HasPosition(landLat, landLng))
             {
-                messages.Add("Азимут: стовпець 'AZ' не знайдено в таблиці.");
+                messages.Add($"Точка {landIdx + 1} (LAND) не має координат.");
+                _rowsToHighlight.Add(landIdx);
                 return;
             }
 
-            // Indices from the end: n-1 (last), n-2, n-3 (ignored command), n-4.
-            int iLast = count - 1;
-            int iSecond = count - 2;
-            int iFourth = count - 4;
+            int prevIdx = -1;
+            for (int i = landIdx - 1; i >= 0; i--)
+            {
+                if (HasPosition(GetCellDouble(_grid.Rows[i], latCol), GetCellDouble(_grid.Rows[i], lngCol)))
+                {
+                    prevIdx = i;
+                    break;
+                }
+            }
+            if (prevIdx < 0) return;
 
-            double azRef = GetCellDouble(_grid.Rows[iLast], azCol);
-            double azSecond = GetCellDouble(_grid.Rows[iSecond], azCol);
-            double azFourth = GetCellDouble(_grid.Rows[iFourth], azCol);
+            double dist = HaversineMeters(
+                GetCellDouble(_grid.Rows[prevIdx], latCol), GetCellDouble(_grid.Rows[prevIdx], lngCol),
+                landLat, landLng);
 
-            bool secondOk = AngularDiff(azRef, azSecond) <= AzimuthToleranceDeg;
-            bool fourthOk = AngularDiff(azRef, azFourth) <= AzimuthToleranceDeg;
-
-            if (!secondOk || !fourthOk)
+            if (dist < MinDistanceBeforeLandM)
             {
                 messages.Add(
-                    $"Розбіжність азимута на останніх точках (ігноруючи точку {iSecond}): " +
-                    $"точка {iFourth + 1}={azFourth:0.#}°, точка {iSecond + 1}={azSecond:0.#}°, точка {iLast + 1}={azRef:0.#}°. " +
-                    "Вони мають бути однаковими.");
-
-                _rowsToHighlight.Add(iLast);
-                _rowsToHighlight.Add(iSecond);
-                _rowsToHighlight.Add(iFourth);
+                    $"Точка {prevIdx + 1} (остання перед LAND) має бути щонайменше за " +
+                    $"{MinDistanceBeforeLandM / 1000.0:0.#} км від точки LAND (зараз {dist / 1000.0:0.##} км).");
+                _rowsToHighlight.Add(prevIdx);
+                _rowsToHighlight.Add(landIdx);
             }
         }
 
@@ -755,7 +718,8 @@ namespace MissionHelperExtension
         }
 
         /// <summary>
-        /// Rule 3: every Angle value must be within [-2, +2].
+        /// Rule 3: every Angle value must be within [-2, +2]. The LAND waypoint is not
+        /// checked.
         /// </summary>
         private void CheckAngles(int count, List<string> messages)
         {
@@ -771,15 +735,13 @@ namespace MissionHelperExtension
             var badRows = new List<string>();
             for (int i = 0; i < count; i++)
             {
+                if (cmdCol != null && CommandEquals(GetCellString(_grid.Rows[i], cmdCol), "LAND"))
+                    continue;
+
                 double angle = GetCellDouble(_grid.Rows[i], angleCol);
-
-                bool isLand = cmdCol != null && CommandEquals(GetCellString(_grid.Rows[i], cmdCol), "LAND");
-                double min = isLand ? LandAngleMin : AngleMin;
-                double max = isLand ? LandAngleMax : AngleMax;
-
-                if (angle < min || angle > max)
+                if (angle < AngleMin || angle > AngleMax)
                 {
-                    badRows.Add($"точка {i + 1}={angle:0.##}° (дозволено [{min:0.#}..{max:0.#}])");
+                    badRows.Add($"точка {i + 1}={angle:0.##}° (дозволено [{AngleMin:0.#}..{AngleMax:0.#}])");
                     _rowsToHighlight.Add(i);
                 }
             }
@@ -797,7 +759,7 @@ namespace MissionHelperExtension
         /// <see cref="TurnWarnAngle"/> degrees. 180° is a straight pass-through; a smaller
         /// angle is a sharper turn. Between the two thresholds is a warning (yellow), below
         /// <see cref="TurnErrorAngle"/> is an error (red). Command waypoints without a
-        /// position (e.g. DO_CHANGE_SPEED) are skipped so they don't distort the geometry.
+        /// position are skipped so they don't distort the geometry.
         /// </summary>
         private void CheckTurnAngles(int count, List<string> messages)
         {
@@ -1232,15 +1194,6 @@ namespace MissionHelperExtension
         }
 
         /// <summary>
-        /// Smallest absolute angular difference between two bearings, accounting for wrap.
-        /// </summary>
-        private static double AngularDiff(double a, double b)
-        {
-            double d = Math.Abs(a - b) % 360.0;
-            return d > 180.0 ? 360.0 - d : d;
-        }
-
-        /// <summary>
         /// Number of "real" waypoint rows, skipping any trailing empty/new row that
         /// the grid keeps for user input.
         /// </summary>
@@ -1284,7 +1237,7 @@ namespace MissionHelperExtension
         {
             if (_grid == null) return "";
 
-            string azCol = FindColumn("AZ", "az", "Azimuth", "azimuth");
+            string cmdCol = FindColumn("Command", "command", "CMD", "cmd");
             string frameCol = FindColumn("Frame", "frame", "FRAME");
             string angleCol = FindColumn("Angle", "angle", "ANGLE");
             string altCol = FindColumn("Alt", "alt", "ALT", "Altitude", "altitude", "Z", "z");
@@ -1303,7 +1256,7 @@ namespace MissionHelperExtension
             for (int i = 0; i < _grid.RowCount; i++)
             {
                 var row = _grid.Rows[i];
-                if (azCol != null) sb.Append(GetCellString(row, azCol));
+                if (cmdCol != null) sb.Append(GetCellString(row, cmdCol));
                 sb.Append(',');
                 if (frameCol != null) sb.Append(GetCellString(row, frameCol));
                 sb.Append(',');
